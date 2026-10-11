@@ -1,18 +1,29 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import Redis from "ioredis";
 
 // MVP 阶段还没有接入真实的 AI 推理，这里用固定的 token 列表模拟"逐字吐字"的效果。
-// 后续模块A会把这一步换成从 Redis Stream 里取任务再执行，但对外的 SSE 接口形状不变。
 const MOCK_TOKENS = ["Hello", ", ", "world", "!"];
 
-export interface StartGatewayOptions {
-  // 每个 token 之间等待的毫秒数。设为 0（默认）时不等待，方便大多数测试跑得快；
-  // 调大之后可以在测试里观察到"分块到达"而不是"一次性吐完"，也是后面复现队列堆积场景的开关。
-  tokenDelayMs?: number;
-  // 允许外部自定义要流式输出的 token 序列，而不是写死用 MOCK_TOKENS。
-  tokens?: string[];
+export interface GatewayEvent {
+  type: "dispatched" | "completed";
+  jobId: string;
 }
 
-// 用 setTimeout 包一层 Promise，模拟真实推理里"等一会儿才有下一个 token"的延迟。
+export interface StartGatewayOptions {
+  // 每个 token 之间等待的毫秒数，默认 0（不等待），方便大多数测试跑得快。
+  tokenDelayMs?: number;
+  // 允许外部自定义要流式输出的 token 序列。
+  tokens?: string[];
+  // 可观测性钩子：外部可以观察"请求被派发到队列""worker 处理完成"这两个时刻，
+  // 用来证明请求确实走了 Redis Stream，而不用在测试里直接戳 Redis 内部状态。
+  onEvent?: (event: GatewayEvent) => void;
+  // 每个网关实例默认用随机生成的独立 Stream key，避免并行跑的多个实例
+  // （比如并行执行的测试文件）互相偷对方的任务；生产环境可以传固定 key 复用。
+  streamKey?: string;
+  redisUrl?: string;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -20,36 +31,106 @@ function delay(ms: number): Promise<void> {
 export function startGateway(options: StartGatewayOptions = {}): Server {
   const tokenDelayMs = options.tokenDelayMs ?? 0;
   const tokens = options.tokens ?? MOCK_TOKENS;
+  const onEvent = options.onEvent ?? (() => {});
+  const streamKey = options.streamKey ?? `chat:jobs:${randomUUID()}`;
+  // 显式用 127.0.0.1 而不是 localhost：本机上 localhost 会先解析到 IPv6 的 ::1，
+  // 而 Docker 的端口映射走的是 IPv4，解析到 ::1 会导致连接悬挂超时。
+  const redisUrl = options.redisUrl ?? "redis://127.0.0.1:6379";
 
-  return createServer((req, res) => {
+  // XREAD 的 BLOCK 模式会占住连接直到有数据或超时，不能和普通命令共用一条连接，
+  // 所以派发请求（XADD）和消费任务（XREAD）各用自己的连接。
+  const redis = new Redis(redisUrl);
+  const consumerConnection = new Redis(redisUrl);
+
+  // 请求进来后先去排队，worker 真正处理完才知道要把结果写回哪个 HTTP 响应，
+  // 所以要按 jobId 记住"是谁在等这个结果"。
+  const pendingResponses = new Map<string, ServerResponse>();
+
+  let stopped = false;
+
+  async function runWorker(): Promise<void> {
+    // "$" 只在第一次调用时代表"从现在开始"；之后改用上一条消息的 ID 继续往后读，
+    // 避免每次都重新解析"$"而在两次调用之间的空隙里漏掉刚好插入的新消息。
+    let lastId = "$";
+
+    while (!stopped) {
+      const result = await consumerConnection.xread(
+        "BLOCK",
+        200,
+        "STREAMS",
+        streamKey,
+        lastId,
+      );
+      if (!result) continue;
+
+      const streams = result as unknown as [string, [string, string[]][]][];
+      for (const [, entries] of streams) {
+        for (const [jobId, fields] of entries) {
+          lastId = jobId;
+
+          const res = pendingResponses.get(jobId);
+          if (!res) continue; // 不是本实例派发的任务（理论上不会发生，因为 stream key 是独立的）
+
+          const fieldMap: Record<string, string> = {};
+          for (let i = 0; i < fields.length; i += 2) {
+            fieldMap[fields[i]] = fields[i + 1];
+          }
+          const jobTokens: string[] = JSON.parse(fieldMap.tokens);
+          const jobDelayMs = Number(fieldMap.tokenDelayMs);
+
+          for (const token of jobTokens) {
+            res.write(`data: ${token}\n\n`);
+            if (jobDelayMs > 0) await delay(jobDelayMs);
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+
+          pendingResponses.delete(jobId);
+          onEvent({ type: "completed", jobId });
+        }
+      }
+    }
+  }
+
+  const workerPromise = runWorker();
+
+  const server = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/chat") {
-      // SSE（Server-Sent Events）要求这三个响应头：
-      // - content-type 必须是 text/event-stream，浏览器/客户端靠这个识别这是一个事件流而不是普通响应体
-      // - no-cache 防止中间代理或浏览器把流式响应缓存住
-      // - keep-alive 保持连接不被提前关闭，因为后面还要分批 write
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
 
-      // 用一个立即执行的 async 函数来逐个 write，中间插入可配置的延迟，
-      // 这样客户端收到的就是多个分开的 chunk，而不是 Node 把所有内容攒成一个 chunk 一次性发出去。
       void (async () => {
-        for (const token of tokens) {
-          res.write(`data: ${token}\n\n`);
-          if (tokenDelayMs > 0) await delay(tokenDelayMs);
-        }
-        // [DONE] 是约定的结束标记（很多 SSE 风格的 API，比如 OpenAI 的流式接口都用这个惯例），
-        // 客户端看到这个事件就知道流结束了，不用等连接真正关闭才能判断。
-        res.write("data: [DONE]\n\n");
-        res.end();
+        // 请求本身不再直接跑 mock 推理，而是把"要跑什么"交给 Redis Stream，
+        // 由上面的 worker 循环取出来执行——对客户端来说接口和行为完全不变。
+        const jobId = await redis.xadd(
+          streamKey,
+          "*",
+          "tokens",
+          JSON.stringify(tokens),
+          "tokenDelayMs",
+          String(tokenDelayMs),
+        );
+        if (!jobId) return;
+        pendingResponses.set(jobId, res);
+        onEvent({ type: "dispatched", jobId });
       })();
       return;
     }
 
-    // 这张票只实现 /chat 这一个路由，其它路径统一 404。
     res.writeHead(404);
     res.end();
   });
+
+  server.on("close", () => {
+    stopped = true;
+    void workerPromise.then(() => {
+      redis.disconnect();
+      consumerConnection.disconnect();
+    });
+  });
+
+  return server;
 }
