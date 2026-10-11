@@ -58,7 +58,7 @@ describe("gateway dispatches chat requests through a Redis Stream", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi" }),
     });
-
+    console.log("client got response, status", res.status);
     // 外部可见行为必须和 ticket #2 时一样：客户端照样拿到完整的流式序列。
     const parsedEvents = parseSseEvents(await res.text());
     expect(parsedEvents).toEqual(["Hello", ", ", "world", "!", "[DONE]"]);

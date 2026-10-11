@@ -8,7 +8,9 @@
   },
   "scripts": {
     "dev": "tsx src/gateway.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "demo:basic": "tsx demo/basic-streaming.ts",
+    "demo:crash": "tsx demo/crash-and-redeliver.ts"
   },
   "keywords": [],
   "author": "",
