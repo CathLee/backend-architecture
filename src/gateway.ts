@@ -8,8 +8,9 @@ const MOCK_TOKENS = ["Hello", ", ", "world", "!"];
 const GROUP_NAME = "chat-workers";
 
 export interface GatewayEvent {
-  type: "dispatched" | "claimed" | "completed" | "redelivered";
-  jobId: string;
+  type: "dispatched" | "claimed" | "completed" | "redelivered" | "rejected";
+  // "rejected" 没有 jobId：请求在真正进入队列之前就被拒绝了，根本没有被派发过。
+  jobId?: string;
   consumerName?: string;
   // 只在 "dispatched" 事件上有意义：这个请求派发时，前面已经有多少个还没完成的任务
   // 超出了 worker 池的容量（即它大概要排多久的队）。0 表示能立刻被某个 worker 处理。
@@ -36,6 +37,14 @@ export interface StartGatewayOptions {
   // claim 到任务之后、真正开始处理之前人为等待的毫秒数。默认 0（生产环境不需要），
   // 测试里调大一点可以稳定地在"崩溃模拟"落地之前留出可观察、可操作的窗口。
   claimToProcessGraceMs?: number;
+  // 允许排队等待的任务数上限（不算正在被 worker 处理的那些）。默认不限制。
+  // 一旦达到 workerCount + maxQueueDepth 的总容量，新请求会被直接拒绝（429），
+  // 而不是无限堆积在 Redis Stream 里——这是防止内存/延迟无限增长的关键。
+  maxQueueDepth?: number;
+  // 负责派发请求（XADD）的连接池大小。默认 1。调大可以避免所有并发请求的
+  // 派发命令都挤在同一条连接上排队——这是和 workerCount（消费者连接数）分开的
+  // 另一组连接，因为派发是非阻塞命令，天然适合池化、轮询分摊。
+  dispatchPoolSize?: number;
 }
 
 export interface GatewayServer extends Server {
@@ -48,6 +57,27 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// 一组各自独立的 Redis 连接，轮询分配给调用方——用于非阻塞命令（这里是 XADD），
+// 避免所有并发请求的派发都挤在同一条连接上排队等待。
+class RedisPool {
+  private readonly connections: Redis[];
+  private cursor = 0;
+
+  constructor(redisUrl: string, size: number) {
+    this.connections = Array.from({ length: size }, () => new Redis(redisUrl));
+  }
+
+  next(): Redis {
+    const connection = this.connections[this.cursor % this.connections.length];
+    this.cursor += 1;
+    return connection;
+  }
+
+  disconnectAll(): void {
+    for (const connection of this.connections) connection.disconnect();
+  }
+}
+
 export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   const tokenDelayMs = options.tokenDelayMs ?? 0;
   const tokens = options.tokens ?? MOCK_TOKENS;
@@ -56,11 +86,13 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   const workerCount = options.workerCount ?? 1;
   const staleAfterMs = options.consumerStaleAfterMs ?? 5000;
   const claimToProcessGraceMs = options.claimToProcessGraceMs ?? 0;
+  const maxQueueDepth = options.maxQueueDepth ?? Infinity;
+  const dispatchPoolSize = options.dispatchPoolSize ?? 1;
   // 显式用 127.0.0.1 而不是 localhost：本机上 localhost 会先解析到 IPv6 的 ::1，
   // 而 Docker 的端口映射走的是 IPv4，解析到 ::1 会导致连接悬挂超时。
   const redisUrl = options.redisUrl ?? "redis://127.0.0.1:6379";
 
-  const dispatchConnection = new Redis(redisUrl);
+  const dispatchPool = new RedisPool(redisUrl, dispatchPoolSize);
 
   // 请求进来后先去排队，worker 真正处理完才知道要把结果写回哪个 HTTP 响应，
   // 所以要按 jobId 记住"是谁在等这个结果"。这个映射被所有 worker 共享：
@@ -205,16 +237,36 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
 
   const server = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/chat") {
+      // 准入控制：在真正写 SSE 响应头、真正派发到 Redis 之前就决定接不接这个请求。
+      // 一旦当前排队深度已经达到上限，直接拒绝——不让 Redis Stream 无限变长，
+      // 这是"持续超载也不会无限增长"的关键，而不是先收下来再想办法。
+      const currentQueueDepth = Math.max(0, unfinishedCount - workerCount);
+      if (currentQueueDepth >= maxQueueDepth) {
+        res.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after": "1",
+        });
+        res.end(JSON.stringify({ error: "overloaded", retryAfterSeconds: 1 }));
+        onEvent({ type: "rejected" });
+        return;
+      }
+
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
 
+      // 准入名额要在这里、同步地占住，不能等 XADD 这个异步操作完成之后再加计数——
+      // 否则并发到达的好几个请求会在各自的 XADD 都还没 resolve 之前，
+      // 读到同一个"还没涨上去"的 unfinishedCount，导致准入检查形同虚设。
+      unfinishedCount += 1;
+      const queueDepth = Math.max(0, unfinishedCount - workerCount);
+
       void (async () => {
         // 请求本身不再直接跑 mock 推理，而是把"要跑什么"交给 Redis Stream，
         // 由 worker 们取出来执行——对客户端来说接口和行为完全不变。
-        const jobId = await dispatchConnection.xadd(
+        const jobId = await dispatchPool.next().xadd(
           streamKey,
           "*",
           "tokens",
@@ -224,10 +276,6 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
         );
         if (!jobId) return;
         pendingResponses.set(jobId, res);
-        // 派发时统计一下"这个任务前面已经堆了多少个还没处理完的"——
-        // 超过 workerCount 的那部分就是真的要排队等待，而不是立刻被处理。
-        unfinishedCount += 1;
-        const queueDepth = Math.max(0, unfinishedCount - workerCount);
         onEvent({ type: "dispatched", jobId, queueDepth });
       })();
       return;
@@ -244,7 +292,7 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   server.on("close", () => {
     stopped = true;
     void Promise.all(workerPromises).then(() => {
-      dispatchConnection.disconnect();
+      dispatchPool.disconnectAll();
     });
   });
 
