@@ -156,9 +156,11 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     while (!stopped) {
       if (killed[index]) return;
 
+      //  先检查有没有被中断、需要重新认领的旧任务
       const staleEntry = await claimStale(connection, consumerName);
       let entry = staleEntry;
 
+      // 如果没有需要重新认领的旧任务（if (!entry)），才去走正常路径——用 XREADGROUP 从 Stream 里读一条全新的、还没被任何人处理过的消息
       if (!entry) {
         const result = (await connection.xreadgroup(
           "GROUP",
