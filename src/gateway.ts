@@ -11,6 +11,9 @@ export interface GatewayEvent {
   type: "dispatched" | "claimed" | "completed" | "redelivered";
   jobId: string;
   consumerName?: string;
+  // 只在 "dispatched" 事件上有意义：这个请求派发时，前面已经有多少个还没完成的任务
+  // 超出了 worker 池的容量（即它大概要排多久的队）。0 表示能立刻被某个 worker 处理。
+  queueDepth?: number;
 }
 
 export interface StartGatewayOptions {
@@ -63,6 +66,10 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   // 所以要按 jobId 记住"是谁在等这个结果"。这个映射被所有 worker 共享：
   // 不管最终是哪个 worker 完成了任务，都能找到正确的客户端连接。
   const pendingResponses = new Map<string, ServerResponse>();
+
+  // 有多少个任务已经派发但还没完成（不管是正在被某个 worker 处理，还是还在排队）。
+  // 用来算 queueDepth：超过 workerCount 的那部分就是"排在队列里、还没轮到的"。
+  let unfinishedCount = 0;
 
   let stopped = false;
   // 每个 worker 一个独立的"已被杀死"标记，killWorker(i) 只影响第 i 个。
@@ -144,6 +151,7 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
 
     pendingResponses.delete(jobId);
     await connection.xack(streamKey, GROUP_NAME, jobId);
+    unfinishedCount -= 1;
     onEvent({ type: "completed", jobId, consumerName });
   }
 
@@ -216,7 +224,11 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
         );
         if (!jobId) return;
         pendingResponses.set(jobId, res);
-        onEvent({ type: "dispatched", jobId });
+        // 派发时统计一下"这个任务前面已经堆了多少个还没处理完的"——
+        // 超过 workerCount 的那部分就是真的要排队等待，而不是立刻被处理。
+        unfinishedCount += 1;
+        const queueDepth = Math.max(0, unfinishedCount - workerCount);
+        onEvent({ type: "dispatched", jobId, queueDepth });
       })();
       return;
     }

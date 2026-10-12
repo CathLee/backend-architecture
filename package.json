@@ -10,7 +10,8 @@
     "dev": "tsx src/gateway.ts",
     "test": "vitest run",
     "demo:basic": "tsx demo/basic-streaming.ts",
-    "demo:crash": "tsx demo/crash-and-redeliver.ts"
+    "demo:crash": "tsx demo/crash-and-redeliver.ts",
+    "demo:concurrency": "tsx demo/concurrency-limit.ts"
   },
   "keywords": [],
   "author": "",
