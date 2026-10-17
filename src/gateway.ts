@@ -4,7 +4,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import Redis from "ioredis";
 import { SessionStore, type Turn } from "./session-store.ts";
 
@@ -24,6 +24,7 @@ export interface GatewayEvent {
   // "rejected" 没有 jobId：请求在真正进入队列之前就被拒绝了，根本没有被派发过。
   jobId?: string;
   consumerName?: string;
+  // 在 "dispatched" 事件上表示"路由到了哪个 worker 的分片"；在其它事件上表示"是哪个 worker 在处理"。
   // 只在 "dispatched" 事件上有意义：这个请求派发时，前面已经有多少个还没完成的任务
   // 超出了 worker 池的容量（即它大概要排多久的队）。0 表示能立刻被某个 worker 处理。
   queueDepth?: number;
@@ -57,6 +58,9 @@ export interface StartGatewayOptions {
   // 派发命令都挤在同一条连接上排队——这是和 workerCount（消费者连接数）分开的
   // 另一组连接，因为派发是非阻塞命令，天然适合池化、轮询分摊。
   dispatchPoolSize?: number;
+  // 每个会话最多保留多少轮历史（滑动窗口，见 docs/adr/0001）。默认 20，最小 1。
+  // 超出的最早几轮会从 Redis 里真正删掉，送进推理的上下文因此也有上限。
+  maxHistoryTurns?: number;
 }
 
 export interface GatewayServer extends Server {
@@ -67,8 +71,9 @@ export interface GatewayServer extends Server {
 
 // mock 推理：回复里会带上这个会话之前说过的话，用来证明历史真的被带进了推理。
 // 刻意不回显当前这一轮的 prompt，这样"回复里出现某句话"只可能来自历史。
+// 开头的 "Seen N earlier turn(s)" 是推理实际拿到的上下文轮数——裁剪之后它有上限。
 function mockInfer(history: Turn[]): string[] {
-  const reply = [`Turn ${history.length + 1}. `];
+  const reply = [`Seen ${history.length} earlier turn(s). `];
   if (history.length === 0) {
     reply.push("No earlier context.");
   } else {
@@ -94,6 +99,13 @@ async function readChatRequest(
   } catch {
     return { prompt: "" };
   }
+}
+
+// 会话亲和性用的 rendezvous（最高随机权重）哈希：对每个候选 worker 算 hash(sessionId, worker)，
+// 取分数最高的那个。同一个 sessionId 永远选中同一个 worker；
+// 某个 worker 下线时，只有原本落在它身上的会话会换 worker，其它会话不受影响。
+function rendezvousScore(sessionId: string, worker: number): number {
+  return createHash("sha1").update(`${sessionId}#${worker}`).digest().readUInt32BE(0);
 }
 
 function delay(ms: number): Promise<void> {
@@ -135,11 +147,20 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   // 而 Docker 的端口映射走的是 IPv4，解析到 ::1 会导致连接悬挂超时。
   const redisUrl = options.redisUrl ?? "redis://127.0.0.1:6379";
 
+  const maxHistoryTurns = Math.max(1, options.maxHistoryTurns ?? 20);
+
   const dispatchPool = new RedisPool(redisUrl, dispatchPoolSize);
-  const sessionStore = new SessionStore(redisUrl);
+  const sessionStore = new SessionStore(redisUrl, maxHistoryTurns);
+
+  // 每个 worker 有自己的一条 Stream（分片），而不是所有 worker 抢同一条：
+  // 只有这样网关才能决定"这个任务交给谁"，会话亲和性才有可能实现。
+  // 每个分片仍然用 Consumer Group，ack / pending / 崩溃后重新认领的机制和之前完全一样。
+  const shardKeys = Array.from({ length: workerCount }, (_, i) => `${streamKey}:${i}`);
+  // 每个分片上派发了但还没完成的任务数，用来给没有 session 的请求挑最空闲的 worker。
+  const shardLoad: number[] = Array.from({ length: workerCount }, () => 0);
 
   // 请求进来后先去排队，worker 真正处理完才知道要把结果写回哪个 HTTP 响应，
-  // 所以要按 jobId 记住"是谁在等这个结果"。这个映射被所有 worker 共享：
+  // 所以要按 requestId 记住"是谁在等这个结果"。这个映射被所有 worker 共享：
   // 不管最终是哪个 worker 完成了任务，都能找到正确的客户端连接。
   // dispatched 是"网关已确认派发"的信号：worker 可能比 XADD 的回复更早读到任务，
   // 所以 worker 要等它 resolve 之后才算 claimed，保证可观测事件顺序始终是 dispatched -> claimed。
@@ -154,51 +175,108 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
 
   let stopped = false;
   // 每个 worker 一个独立的"已被杀死"标记，killWorker(i) 只影响第 i 个。
+  // 路由时它也充当"健康检查"：生产环境里这份存活名单来自心跳/注册中心，这里用进程内标记代替。
   const killed: boolean[] = Array.from({ length: workerCount }, () => false);
 
-  async function ensureGroup(connection: Redis): Promise<void> {
-    try {
-      // 从 "0" 而不是 "$" 开始：请求在 worker 建好组之前就可能已经 XADD 了，
-      // 用 "$" 会让这些先到的任务永远不被投递给组，客户端就一直挂着。
-      await connection.xgroup("CREATE", streamKey, GROUP_NAME, "0", "MKSTREAM");
-    } catch (err) {
-      // BUSYGROUP 表示组已经存在，忽略；其它错误才需要真正关心。
-      if (!(err as Error).message.includes("BUSYGROUP")) throw err;
+  function liveWorkers(): number[] {
+    const live = killed.flatMap((dead, i) => (dead ? [] : [i]));
+    // 全部挂了也得有个去处：任务会留在分片里，等 worker 恢复（或被判定 stale 后认领）。
+    return live.length > 0 ? live : killed.map((_, i) => i);
+  }
+
+  // 路由：有 session 的请求按 rendezvous 哈希固定到某个存活的 worker（亲和性）；
+  // 没有 session 的请求没有"必须去哪"的理由，就交给当前负载最低的 worker。
+  function pickShard(sessionId: string | undefined): number {
+    const live = liveWorkers();
+    if (sessionId) {
+      let best = live[0];
+      let bestScore = -1;
+      for (const i of live) {
+        const score = rendezvousScore(sessionId, i);
+        if (score > bestScore) [best, bestScore] = [i, score];
+      }
+      return best;
+    }
+    return live.reduce((a, b) => (shardLoad[b] < shardLoad[a] ? b : a));
+  }
+
+  async function ensureGroups(connection: Redis): Promise<void> {
+    for (const key of shardKeys) {
+      try {
+        // 从 "0" 而不是 "$" 开始：请求在 worker 建好组之前就可能已经 XADD 了，
+        // 用 "$" 会让这些先到的任务永远不被投递给组，客户端就一直挂着。
+        await connection.xgroup("CREATE", key, GROUP_NAME, "0", "MKSTREAM");
+      } catch (err) {
+        // BUSYGROUP 表示组已经存在，忽略；其它错误才需要真正关心。
+        if (!(err as Error).message.includes("BUSYGROUP")) throw err;
+      }
     }
   }
 
-  // 尝试从 pending 列表里"认领"一条空闲超过 staleAfterMs 的消息——
+  // 尝试从各个分片的 pending 列表里"认领"一条空闲超过 staleAfterMs 的消息——
   // 也就是别的 worker 已经 claim 但还没 ack、且已经沉默太久的任务，视为那个 worker 已经挂了。
+  // 要扫所有分片，而不只是自己的：挂掉的正是别的分片的主人。
   async function claimStale(
     connection: Redis,
     consumerName: string,
-  ): Promise<[string, string[]] | null> {
-    const pendingList = (await connection.xpending(
-      streamKey,
-      GROUP_NAME,
-      "IDLE",
-      staleAfterMs,
-      "-",
-      "+",
-      1,
-    )) as [string, string, number, number][] | null;
-    if (!pendingList || pendingList.length === 0) return null;
+  ): Promise<[string, [string, string[]]] | null> {
+    for (const key of shardKeys) {
+      const pendingList = (await connection.xpending(
+        key,
+        GROUP_NAME,
+        "IDLE",
+        staleAfterMs,
+        "-",
+        "+",
+        1,
+      )) as [string, string, number, number][] | null;
+      if (!pendingList || pendingList.length === 0) continue;
 
-    const [staleId] = pendingList[0];
-    const claimed = (await connection.xclaim(
-      streamKey,
+      const [staleId] = pendingList[0];
+      const claimed = (await connection.xclaim(
+        key,
+        GROUP_NAME,
+        consumerName,
+        staleAfterMs,
+        staleId,
+      )) as [string, string[]][] | null;
+      if (!claimed || claimed.length === 0) continue;
+
+      onEvent({ type: "redelivered", jobId: staleId, consumerName });
+      return [key, claimed[0]];
+    }
+    return null;
+  }
+
+  async function readOne(
+    connection: Redis,
+    consumerName: string,
+    key: string,
+    blockMs: number | null,
+  ): Promise<[string, string[]] | null> {
+    const blockArgs = blockMs === null ? [] : ["BLOCK", blockMs];
+    const result = (await connection.xreadgroup(
+      "GROUP",
       GROUP_NAME,
       consumerName,
-      staleAfterMs,
-      staleId,
-    )) as [string, string[]][] | null;
-    if (!claimed || claimed.length === 0) return null;
+      ...(blockArgs as ["BLOCK", number]),
+      "COUNT",
+      1,
+      "STREAMS",
+      key,
+      ">",
+    )) as [string, [string, string[]][]][] | null;
+    return result ? result[0][1][0] : null;
+  }
 
-    onEvent({ type: "redelivered", jobId: staleId, consumerName });
-    return claimed[0];
+  function finishJob(requestId: string, shard: number): void {
+    pendingResponses.delete(requestId);
+    unfinishedCount -= 1;
+    shardLoad[shard] -= 1;
   }
 
   async function processJob(
+    jobStream: string,
     jobId: string,
     fields: string[],
     connection: Redis,
@@ -212,6 +290,7 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     // 按 requestId 而不是 jobId 找客户端连接：worker 可能在 XADD 的回复回到网关之前
     // 就已经从 Stream 里读到了这个任务，那时 jobId 还没人知道、没法提前登记。
     const requestId = fieldMap.requestId;
+    const shard = Number(fieldMap.shard);
     const pending = pendingResponses.get(requestId);
     if (!pending) return; // 不是本实例派发的任务，理论上不会发生
     await pending.dispatched;
@@ -227,7 +306,13 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     if (claimToProcessGraceMs > 0) await delay(claimToProcessGraceMs);
     if (killed[index]) return;
 
-    const jobTokens: string[] = JSON.parse(fieldMap.tokens);
+    // 读历史、组装上下文属于"推理"的一部分，放在 worker 里做，而不是在网关派发时做：
+    // 同一个 session 的请求被亲和性路由到同一个 worker、依次执行，
+    // 后一个请求开始推理时，前一个请求的这一轮已经写进历史了。
+    // 如果在网关里提前读，几个同时到达的请求会读到同一份"旧"历史。
+    const jobTokens: string[] = fieldMap.tokens
+      ? JSON.parse(fieldMap.tokens)
+      : mockInfer(await sessionStore.getHistory(fieldMap.sessionId));
     const jobDelayMs = Number(fieldMap.tokenDelayMs);
 
     let lastBeat = Date.now();
@@ -240,7 +325,7 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
       // 真正挂掉的 worker 不会再心跳，仍然会被及时判定为 stale。
       if (!killed[index] && Date.now() - lastBeat >= staleAfterMs / 3) {
         await connection.xclaim(
-          streamKey,
+          jobStream,
           GROUP_NAME,
           consumerName,
           0,
@@ -256,9 +341,8 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
           `event: error\ndata: ${JSON.stringify({ error: "worker_failed", retryable: true })}\n\n`,
         );
         res.end();
-        pendingResponses.delete(requestId);
-        await connection.xack(streamKey, GROUP_NAME, jobId);
-        unfinishedCount -= 1;
+        finishJob(requestId, shard);
+        await connection.xack(jobStream, GROUP_NAME, jobId);
         onEvent({ type: "failed", jobId, consumerName });
         return;
       }
@@ -274,50 +358,55 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     res.write("data: [DONE]\n\n");
     res.end();
 
-    pendingResponses.delete(requestId);
-    await connection.xack(streamKey, GROUP_NAME, jobId);
-    unfinishedCount -= 1;
+    finishJob(requestId, shard);
+    await connection.xack(jobStream, GROUP_NAME, jobId);
     onEvent({ type: "completed", jobId, consumerName });
   }
 
   async function runWorker(index: number): Promise<void> {
     const consumerName = `worker-${index}`;
+    const ownShard = shardKeys[index];
     // XREADGROUP 的 BLOCK 模式会占住连接，每个 worker 必须用自己独立的连接。
     const connection = new Redis(redisUrl);
-    await ensureGroup(connection);
+    await ensureGroups(connection);
 
     while (!stopped) {
-      if (killed[index]) return;
+      if (killed[index]) break;
 
-      //  先检查有没有被中断、需要重新认领的旧任务
-      const staleEntry = await claimStale(connection, consumerName);
-      let entry = staleEntry;
-
-      // 如果没有需要重新认领的旧任务（if (!entry)），才去走正常路径——用 XREADGROUP 从 Stream 里读一条全新的、还没被任何人处理过的消息
-      if (!entry) {
-        const result = (await connection.xreadgroup(
-          "GROUP",
-          GROUP_NAME,
-          consumerName,
-          "BLOCK",
-          200,
-          "COUNT",
-          1,
-          "STREAMS",
-          streamKey,
-          ">",
-        )) as [string, [string, string[]][]][] | null;
-        if (!result) continue;
-        entry = result[0][1][0];
-      }
-
-      if (killed[index]) return;
-
-      const [jobId, fields] = entry;
       try {
-        await processJob(jobId, fields, connection, consumerName, index);
+        // 1. 先检查有没有被中断、需要重新认领的旧任务（任意分片上）。
+        let found = await claimStale(connection, consumerName);
+
+        // 2. 没有的话，从自己的分片读一条全新的消息。
+        if (!found) {
+          const entry = await readOne(connection, consumerName, ownShard, 200);
+          if (entry) found = [ownShard, entry];
+        }
+
+        // 3. 自己的分片也空闲：帮已经下线的 worker 清空它分片里还没人读过的消息。
+        //    路由不会再往那里派新任务，但下线之前已经派过去、还没被读走的任务
+        //    不在任何人的 pending 列表里，第 1 步的 stale 认领找不到它们。
+        if (!found) {
+          for (let j = 0; j < workerCount && !found; j += 1) {
+            if (j === index || !killed[j]) continue;
+            const entry = await readOne(connection, consumerName, shardKeys[j], null);
+            if (entry) found = [shardKeys[j], entry];
+          }
+        }
+
+        if (!found || killed[index]) continue;
+
+        const [jobStream, [jobId, fields]] = found;
+        await processJob(jobStream, jobId, fields, connection, consumerName, index);
       } catch (err) {
-        console.error(`[DEBUG worker-${index}] processJob threw:`, err);
+        if (stopped) break;
+        // 分片的 Stream 被删掉（比如测试或运维清理了 key）会报 NOGROUP：重建消费组后继续。
+        if ((err as Error).message.includes("NOGROUP")) {
+          await ensureGroups(connection).catch(() => {});
+          continue;
+        }
+        console.error(`[worker-${index}] error:`, err);
+        await delay(100);
       }
     }
 
@@ -361,12 +450,17 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
 
       const requestId = randomUUID();
       void (async () => {
+        let shard: number | undefined;
         try {
           const { sessionId, prompt } = await readChatRequest(req);
-          // 有 sessionId 才读历史、才用带历史的 mock 推理；外部显式传了 tokens 时仍以它为准。
-          const history = sessionId ? await sessionStore.getHistory(sessionId) : [];
-          const jobTokens =
-            sessionId && !options.tokens ? mockInfer(history) : tokens;
+          // 选分片和占分片负载必须在同一个同步片段里完成，中间不能有 await，
+          // 否则并发请求会看到同一个"最空闲"的分片、全挤过去。
+          shard = pickShard(sessionId);
+          shardLoad[shard] += 1;
+
+          // 有 sessionId（且外部没有显式指定 tokens）时，不在这里定好 tokens，
+          // 而是让 worker 读历史后现场推理；否则直接把要吐的 tokens 放进任务里。
+          const inferInWorker = sessionId !== undefined && !options.tokens;
 
           // 请求本身不再直接跑 mock 推理，而是把"要跑什么"交给 Redis Stream，
           // 由 worker 们取出来执行——对客户端来说接口和行为完全不变。
@@ -374,28 +468,32 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
           const dispatched = new Promise<void>((r) => (markDispatched = r));
           pendingResponses.set(requestId, { res, dispatched, markDispatched });
           const jobId = await dispatchPool.next().xadd(
-            streamKey,
+            shardKeys[shard],
             "*",
-            "tokens",
-            JSON.stringify(jobTokens),
+            ...(inferInWorker ? [] : ["tokens", JSON.stringify(tokens)]),
             "tokenDelayMs",
             String(tokenDelayMs),
             "requestId",
             requestId,
+            "shard",
+            String(shard),
             ...(sessionId ? ["sessionId", sessionId, "prompt", prompt] : []),
           );
           if (!jobId) return;
-          onEvent({ type: "dispatched", jobId, queueDepth });
+          onEvent({
+            type: "dispatched",
+            jobId,
+            queueDepth,
+            consumerName: `worker-${shard}`,
+          });
           markDispatched();
         } catch {
           pendingResponses.delete(requestId);
           // 派发前出错（比如 Redis 不可用）：占着的名额要还回去，并明确告诉客户端失败了。
           unfinishedCount -= 1;
+          if (shard !== undefined) shardLoad[shard] -= 1;
           res.write(
-            `event: error
-data: ${JSON.stringify({ error: "dispatch_failed", retryable: true })}
-
-`,
+            `event: error\ndata: ${JSON.stringify({ error: "dispatch_failed", retryable: true })}\n\n`,
           );
           res.end();
         }

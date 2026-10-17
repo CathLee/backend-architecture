@@ -82,8 +82,15 @@ describe("gateway session state", () => {
     // 会话历史是自己的 list，不是队列 stream 里的消息，也不借用 stream key。
     expect(await cleanup.type(`session:${sessionId}:history`)).toBe("list");
     expect(await cleanup.llen(`session:${sessionId}:history`)).toBe(2);
-    expect(await cleanup.type(streamKey)).toBe("stream");
-    await cleanup.del(streamKey);
+    // 队列按 worker 分片，每个分片是 <streamKey>:<worker 序号>（默认 1 个 worker）。
+    expect(await cleanup.type(`${streamKey}:0`)).toBe("stream");
+
+    // 先关网关、等 worker 最后一轮阻塞读（最长 200ms）结束，再删 stream，
+    // 否则 worker 正在读的 stream 被删会报 NOGROUP。
+    server.close();
+    server = undefined;
+    await new Promise((r) => setTimeout(r, 300));
+    await cleanup.del(`${streamKey}:0`);
   });
 
   it("still serves requests without a sessionId statelessly", async () => {

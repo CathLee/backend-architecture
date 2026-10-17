@@ -44,7 +44,7 @@ server.listen(PORT, async () => {
   console.log(
     `  session:${sessionId}:history  type=${await redis.type(`session:${sessionId}:history`)}  长度=${await redis.llen(`session:${sessionId}:history`)}`,
   );
-  console.log(`  ${streamKey}  type=${await redis.type(streamKey)}`);
+  console.log(`  ${streamKey}:0  type=${await redis.type(`${streamKey}:0`)}`);
   console.log("  ^ 会话历史是独立的 list，和队列的 stream 是两个不同的 key，互不借用存储\n");
 
   // 先关网关，等 worker 的最后一轮 XREADGROUP（最长阻塞 200ms）结束，再清理 key；
@@ -54,7 +54,7 @@ server.listen(PORT, async () => {
   await redis.del(
     `session:${sessionId}:history`,
     `session:${otherSessionId}:history`,
-    streamKey,
+    `${streamKey}:0`,
   );
   redis.disconnect();
 });
