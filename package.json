@@ -11,7 +11,8 @@
     "test": "vitest run",
     "demo:basic": "tsx demo/basic-streaming.ts",
     "demo:crash": "tsx demo/crash-and-redeliver.ts",
-    "demo:concurrency": "tsx demo/concurrency-limit.ts"
+    "demo:concurrency": "tsx demo/concurrency-limit.ts",
+    "demo:backpressure": "tsx demo/backpressure.ts"
   },
   "keywords": [],
   "author": "",
