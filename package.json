@@ -15,7 +15,8 @@
     "demo:backpressure": "tsx demo/backpressure.ts",
     "demo:stream-crash": "tsx demo/stream-crash.ts",
     "demo:concurrent-streams": "tsx demo/concurrent-streams.ts",
-    "demo:session": "tsx demo/session-memory.ts"
+    "demo:session": "tsx demo/session-memory.ts",
+    "demo:affinity": "tsx demo/session-affinity.ts"
   },
   "keywords": [],
   "author": "",
