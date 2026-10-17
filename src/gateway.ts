@@ -238,10 +238,13 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   const server = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/chat") {
       // 准入控制：在真正写 SSE 响应头、真正派发到 Redis 之前就决定接不接这个请求。
-      // 一旦当前排队深度已经达到上限，直接拒绝——不让 Redis Stream 无限变长，
-      // 这是"持续超载也不会无限增长"的关键，而不是先收下来再想办法。
-      const currentQueueDepth = Math.max(0, unfinishedCount - workerCount);
-      if (currentQueueDepth >= maxQueueDepth) {
+      // 一旦达到 workerCount + maxQueueDepth 的总容量，直接拒绝——不让 Redis Stream
+      // 无限变长，这是"持续超载也不会无限增长"的关键，而不是先收下来再想办法。
+      // 注意不能先对 (unfinishedCount - workerCount) 做 Math.max(0, ...) 再比较：
+      // 空闲时 unfinishedCount < workerCount，clamp 后会变成 0，
+      // 当 maxQueueDepth 也配置成 0（"不排队，但允许跑满 workerCount 个"）时，
+      // 0 >= 0 恒成立，会导致空闲网关也把所有请求 429 掉。
+      if (unfinishedCount >= workerCount + maxQueueDepth) {
         res.writeHead(429, {
           "content-type": "application/json",
           "retry-after": "1",

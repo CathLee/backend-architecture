@@ -68,4 +68,32 @@ describe("gateway backpressure", () => {
       expect(events).toEqual(["Hello", ", ", "world", "!", "[DONE]"]);
     }
   });
+
+  // maxQueueDepth: 0 代表"不允许排队，但仍然允许跑满 workerCount 个"，
+  // 不等同于"容量为零、什么都不接受"。空闲网关必须依然能接受 workerCount 个请求。
+  it("with maxQueueDepth 0, still admits up to workerCount requests while idle instead of rejecting everything", async () => {
+    server = startGateway({
+      workerCount: 2,
+      maxQueueDepth: 0,
+      tokenDelayMs: 50,
+    }) as GatewayServer;
+    const port = await listen(server);
+
+    const responses = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        fetch(`http://localhost:${port}/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ prompt: "hi" }),
+        }),
+      ),
+    );
+
+    const accepted = responses.filter((r) => r.status === 200);
+    const rejected = responses.filter((r) => r.status === 429);
+
+    // 容量 = workerCount(2) + maxQueueDepth(0) = 2：3 个并发请求里恰好 2 个被接受。
+    expect(accepted).toHaveLength(2);
+    expect(rejected).toHaveLength(1);
+  });
 });
