@@ -108,6 +108,33 @@ describe("gateway stream resilience", () => {
     expect(events.filter((e) => e.type === "failed")).toHaveLength(1);
   });
 
+  it("a healthy worker whose stream outlasts consumerStaleAfterMs keeps its job: no redelivery, no duplicated tokens", async () => {
+    const events: GatewayEvent[] = [];
+    const tokens = Array.from({ length: 8 }, (_, i) => `t${i}`);
+
+    // 流总时长约 8 * 60 = 480ms，远超 staleAfterMs(100ms)，但 worker 一直活着。
+    server = startGateway({
+      workerCount: 2,
+      consumerStaleAfterMs: 100,
+      tokenDelayMs: 60,
+      tokens,
+      onEvent: (e) => events.push(e),
+    }) as GatewayServer;
+    const port = await listen(server);
+
+    const res = await fetch(`http://localhost:${port}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi" }),
+    });
+    const frames = parseSseFrames(await readWithin(res, 3000));
+
+    expect(frames.map((f) => f.data)).toEqual([...tokens, "[DONE]"]);
+    await waitFor(() => events.find((e) => e.type === "completed"));
+    expect(events.filter((e) => e.type === "redelivered")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "completed")).toHaveLength(1);
+  });
+
   it("many concurrently open streams never exceed workerCount in flight, and everything beyond workerCount + maxQueueDepth is rejected", async () => {
     let inFlight = 0;
     let maxInFlight = 0;

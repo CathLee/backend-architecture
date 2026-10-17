@@ -182,9 +182,25 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     const jobTokens: string[] = JSON.parse(fieldMap.tokens);
     const jobDelayMs = Number(fieldMap.tokenDelayMs);
 
+    let lastBeat = Date.now();
     for (const token of jobTokens) {
       res.write(`data: ${token}\n\n`);
       if (jobDelayMs > 0) await delay(jobDelayMs);
+      // 心跳：staleAfterMs 衡量的是"距离上次活动多久"，不是"距离 claim 多久"。
+      // 活着的 worker 推流时间可以任意长，所以要定期把自己这条 pending 消息的 idle 清零，
+      // 否则别的 worker 会误判它挂了、把任务抢走并往同一个响应里重复写。
+      // 真正挂掉的 worker 不会再心跳，仍然会被及时判定为 stale。
+      if (!killed[index] && Date.now() - lastBeat >= staleAfterMs / 3) {
+        await connection.xclaim(
+          streamKey,
+          GROUP_NAME,
+          consumerName,
+          0,
+          jobId,
+          "JUSTID",
+        );
+        lastBeat = Date.now();
+      }
       if (killed[index]) {
         // 已经往客户端推了一部分，不能再让别的 worker 重推整个任务（内容会重复），
         // 所以走"明确失败"：告诉客户端可重试、结束流，并 ack 掉避免被反复重新认领。
