@@ -8,7 +8,13 @@ const MOCK_TOKENS = ["Hello", ", ", "world", "!"];
 const GROUP_NAME = "chat-workers";
 
 export interface GatewayEvent {
-  type: "dispatched" | "claimed" | "completed" | "redelivered" | "rejected";
+  type:
+    | "dispatched"
+    | "claimed"
+    | "completed"
+    | "redelivered"
+    | "rejected"
+    | "failed";
   // "rejected" 没有 jobId：请求在真正进入队列之前就被拒绝了，根本没有被派发过。
   jobId?: string;
   consumerName?: string;
@@ -109,7 +115,9 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
 
   async function ensureGroup(connection: Redis): Promise<void> {
     try {
-      await connection.xgroup("CREATE", streamKey, GROUP_NAME, "$", "MKSTREAM");
+      // 从 "0" 而不是 "$" 开始：请求在 worker 建好组之前就可能已经 XADD 了，
+      // 用 "$" 会让这些先到的任务永远不被投递给组，客户端就一直挂着。
+      await connection.xgroup("CREATE", streamKey, GROUP_NAME, "0", "MKSTREAM");
     } catch (err) {
       // BUSYGROUP 表示组已经存在，忽略；其它错误才需要真正关心。
       if (!(err as Error).message.includes("BUSYGROUP")) throw err;
@@ -174,9 +182,38 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     const jobTokens: string[] = JSON.parse(fieldMap.tokens);
     const jobDelayMs = Number(fieldMap.tokenDelayMs);
 
+    let lastBeat = Date.now();
     for (const token of jobTokens) {
       res.write(`data: ${token}\n\n`);
       if (jobDelayMs > 0) await delay(jobDelayMs);
+      // 心跳：staleAfterMs 衡量的是"距离上次活动多久"，不是"距离 claim 多久"。
+      // 活着的 worker 推流时间可以任意长，所以要定期把自己这条 pending 消息的 idle 清零，
+      // 否则别的 worker 会误判它挂了、把任务抢走并往同一个响应里重复写。
+      // 真正挂掉的 worker 不会再心跳，仍然会被及时判定为 stale。
+      if (!killed[index] && Date.now() - lastBeat >= staleAfterMs / 3) {
+        await connection.xclaim(
+          streamKey,
+          GROUP_NAME,
+          consumerName,
+          0,
+          jobId,
+          "JUSTID",
+        );
+        lastBeat = Date.now();
+      }
+      if (killed[index]) {
+        // 已经往客户端推了一部分，不能再让别的 worker 重推整个任务（内容会重复），
+        // 所以走"明确失败"：告诉客户端可重试、结束流，并 ack 掉避免被反复重新认领。
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ error: "worker_failed", retryable: true })}\n\n`,
+        );
+        res.end();
+        pendingResponses.delete(jobId);
+        await connection.xack(streamKey, GROUP_NAME, jobId);
+        unfinishedCount -= 1;
+        onEvent({ type: "failed", jobId, consumerName });
+        return;
+      }
     }
     res.write("data: [DONE]\n\n");
     res.end();
