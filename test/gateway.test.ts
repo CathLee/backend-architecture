@@ -3,16 +3,7 @@ import { startGateway } from "../src/gateway.ts";
 import type { Server } from "node:http";
 
 // 监听随机端口（传 0 让系统分配），避免测试之间抢占固定端口导致冲突。
-function listen(server: Server): Promise<number> {
-  return new Promise((resolve) => {
-    server.listen(0, () => {
-      const address = server.address();
-      if (address && typeof address === "object") {
-        resolve(address.port);
-      }
-    });
-  });
-}
+import { listen } from "./listen.ts";
 
 // SSE 的原始文本格式是 "data: xxx\n\n"（每条事件后面跟两个换行分隔），
 // 这里把原始响应体按这个格式拆开，只留下每条事件 data 后面的内容，方便断言。

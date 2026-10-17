@@ -2,16 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startGateway } from "../src/gateway.ts";
 import type { Server } from "node:http";
 
-function listen(server: Server): Promise<number> {
-  return new Promise((resolve) => {
-    server.listen(0, () => {
-      const address = server.address();
-      if (address && typeof address === "object") {
-        resolve(address.port);
-      }
-    });
-  });
-}
+import { listen } from "./listen.ts";
 
 // 这组测试要证明"流式"不是嘴上说说：token 之间真的有时间间隔，
 // 不是服务端在内存里拼好完整字符串后一次性吐给客户端。

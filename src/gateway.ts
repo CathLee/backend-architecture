@@ -1,6 +1,12 @@
-import { createServer, type Server, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { randomUUID } from "node:crypto";
 import Redis from "ioredis";
+import { SessionStore, type Turn } from "./session-store.ts";
 
 // MVP 阶段还没有接入真实的 AI 推理，这里用固定的 token 列表模拟"逐字吐字"的效果。
 const MOCK_TOKENS = ["Hello", ", ", "world", "!"];
@@ -59,6 +65,37 @@ export interface GatewayServer extends Server {
   killWorker(index: number): void;
 }
 
+// mock 推理：回复里会带上这个会话之前说过的话，用来证明历史真的被带进了推理。
+// 刻意不回显当前这一轮的 prompt，这样"回复里出现某句话"只可能来自历史。
+function mockInfer(history: Turn[]): string[] {
+  const reply = [`Turn ${history.length + 1}. `];
+  if (history.length === 0) {
+    reply.push("No earlier context.");
+  } else {
+    reply.push("Earlier you said: ", history.map((t) => t.user).join(" | "));
+  }
+  return reply;
+}
+
+async function readChatRequest(
+  req: IncomingMessage,
+): Promise<{ sessionId?: string; prompt: string }> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+    return {
+      sessionId:
+        typeof body.sessionId === "string" && body.sessionId
+          ? body.sessionId
+          : undefined,
+      prompt: typeof body.prompt === "string" ? body.prompt : "",
+    };
+  } catch {
+    return { prompt: "" };
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -99,11 +136,17 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
   const redisUrl = options.redisUrl ?? "redis://127.0.0.1:6379";
 
   const dispatchPool = new RedisPool(redisUrl, dispatchPoolSize);
+  const sessionStore = new SessionStore(redisUrl);
 
   // 请求进来后先去排队，worker 真正处理完才知道要把结果写回哪个 HTTP 响应，
   // 所以要按 jobId 记住"是谁在等这个结果"。这个映射被所有 worker 共享：
   // 不管最终是哪个 worker 完成了任务，都能找到正确的客户端连接。
-  const pendingResponses = new Map<string, ServerResponse>();
+  // dispatched 是"网关已确认派发"的信号：worker 可能比 XADD 的回复更早读到任务，
+  // 所以 worker 要等它 resolve 之后才算 claimed，保证可观测事件顺序始终是 dispatched -> claimed。
+  const pendingResponses = new Map<
+    string,
+    { res: ServerResponse; dispatched: Promise<void>; markDispatched: () => void }
+  >();
 
   // 有多少个任务已经派发但还没完成（不管是正在被某个 worker 处理，还是还在排队）。
   // 用来算 queueDepth：超过 workerCount 的那部分就是"排在队列里、还没轮到的"。
@@ -162,6 +205,18 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     consumerName: string,
     index: number,
   ): Promise<void> {
+    const fieldMap: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i += 2) {
+      fieldMap[fields[i]] = fields[i + 1];
+    }
+    // 按 requestId 而不是 jobId 找客户端连接：worker 可能在 XADD 的回复回到网关之前
+    // 就已经从 Stream 里读到了这个任务，那时 jobId 还没人知道、没法提前登记。
+    const requestId = fieldMap.requestId;
+    const pending = pendingResponses.get(requestId);
+    if (!pending) return; // 不是本实例派发的任务，理论上不会发生
+    await pending.dispatched;
+    const { res } = pending;
+
     onEvent({ type: "claimed", jobId, consumerName });
 
     // claim 到任务之后、真正开始写响应之前留一个小窗口（默认 0，生产环境不需要）。
@@ -172,13 +227,6 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     if (claimToProcessGraceMs > 0) await delay(claimToProcessGraceMs);
     if (killed[index]) return;
 
-    const res = pendingResponses.get(jobId);
-    if (!res) return; // 不是本实例派发的任务，理论上不会发生
-
-    const fieldMap: Record<string, string> = {};
-    for (let i = 0; i < fields.length; i += 2) {
-      fieldMap[fields[i]] = fields[i + 1];
-    }
     const jobTokens: string[] = JSON.parse(fieldMap.tokens);
     const jobDelayMs = Number(fieldMap.tokenDelayMs);
 
@@ -208,17 +256,25 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
           `event: error\ndata: ${JSON.stringify({ error: "worker_failed", retryable: true })}\n\n`,
         );
         res.end();
-        pendingResponses.delete(jobId);
+        pendingResponses.delete(requestId);
         await connection.xack(streamKey, GROUP_NAME, jobId);
         unfinishedCount -= 1;
         onEvent({ type: "failed", jobId, consumerName });
         return;
       }
     }
+    // 先把这一轮写进会话历史，再告诉客户端结束：客户端一收到 [DONE] 就可能立刻发下一轮，
+    // 如果顺序反过来，下一轮可能读不到刚完成的这一轮。
+    if (fieldMap.sessionId) {
+      await sessionStore.appendTurn(fieldMap.sessionId, {
+        user: fieldMap.prompt ?? "",
+        assistant: jobTokens.join(""),
+      });
+    }
     res.write("data: [DONE]\n\n");
     res.end();
 
-    pendingResponses.delete(jobId);
+    pendingResponses.delete(requestId);
     await connection.xack(streamKey, GROUP_NAME, jobId);
     unfinishedCount -= 1;
     onEvent({ type: "completed", jobId, consumerName });
@@ -303,20 +359,46 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
       unfinishedCount += 1;
       const queueDepth = Math.max(0, unfinishedCount - workerCount);
 
+      const requestId = randomUUID();
       void (async () => {
-        // 请求本身不再直接跑 mock 推理，而是把"要跑什么"交给 Redis Stream，
-        // 由 worker 们取出来执行——对客户端来说接口和行为完全不变。
-        const jobId = await dispatchPool.next().xadd(
-          streamKey,
-          "*",
-          "tokens",
-          JSON.stringify(tokens),
-          "tokenDelayMs",
-          String(tokenDelayMs),
-        );
-        if (!jobId) return;
-        pendingResponses.set(jobId, res);
-        onEvent({ type: "dispatched", jobId, queueDepth });
+        try {
+          const { sessionId, prompt } = await readChatRequest(req);
+          // 有 sessionId 才读历史、才用带历史的 mock 推理；外部显式传了 tokens 时仍以它为准。
+          const history = sessionId ? await sessionStore.getHistory(sessionId) : [];
+          const jobTokens =
+            sessionId && !options.tokens ? mockInfer(history) : tokens;
+
+          // 请求本身不再直接跑 mock 推理，而是把"要跑什么"交给 Redis Stream，
+          // 由 worker 们取出来执行——对客户端来说接口和行为完全不变。
+          let markDispatched!: () => void;
+          const dispatched = new Promise<void>((r) => (markDispatched = r));
+          pendingResponses.set(requestId, { res, dispatched, markDispatched });
+          const jobId = await dispatchPool.next().xadd(
+            streamKey,
+            "*",
+            "tokens",
+            JSON.stringify(jobTokens),
+            "tokenDelayMs",
+            String(tokenDelayMs),
+            "requestId",
+            requestId,
+            ...(sessionId ? ["sessionId", sessionId, "prompt", prompt] : []),
+          );
+          if (!jobId) return;
+          onEvent({ type: "dispatched", jobId, queueDepth });
+          markDispatched();
+        } catch {
+          pendingResponses.delete(requestId);
+          // 派发前出错（比如 Redis 不可用）：占着的名额要还回去，并明确告诉客户端失败了。
+          unfinishedCount -= 1;
+          res.write(
+            `event: error
+data: ${JSON.stringify({ error: "dispatch_failed", retryable: true })}
+
+`,
+          );
+          res.end();
+        }
       })();
       return;
     }
@@ -333,6 +415,7 @@ export function startGateway(options: StartGatewayOptions = {}): GatewayServer {
     stopped = true;
     void Promise.all(workerPromises).then(() => {
       dispatchPool.disconnectAll();
+      sessionStore.disconnect();
     });
   });
 

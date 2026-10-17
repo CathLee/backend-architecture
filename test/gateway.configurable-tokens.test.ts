@@ -2,16 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startGateway } from "../src/gateway.ts";
 import type { Server } from "node:http";
 
-function listen(server: Server): Promise<number> {
-  return new Promise((resolve) => {
-    server.listen(0, () => {
-      const address = server.address();
-      if (address && typeof address === "object") {
-        resolve(address.port);
-      }
-    });
-  });
-}
+import { listen } from "./listen.ts";
 
 function parseSseEvents(raw: string): string[] {
   return raw
